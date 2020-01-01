@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fleet_beam_search_2.Actor.graph import Graph
-from fleet_beam_search_2.Actor.fleet import Fleet
-from fleet_beam_search_2.utils.actor_utils import widen, widen_dict
+from just_time_windows.Actor.graph import Graph
+from just_time_windows.Actor.fleet import Fleet
+from just_time_windows.utils.actor_utils import widen_data, select_data
+from just_time_windows.Actor.normalization import Normalization
 
 
 #This is the updated version of the actor
@@ -20,7 +21,7 @@ class Actor(nn.Module):
         self.num_neighbors_action = num_neighbors_action
 
         self.apply_normalization = normalize
-        self.normalization_params = None
+        self.normalization = None
 
 
         if model is None:
@@ -33,7 +34,6 @@ class Actor(nn.Module):
 
 
         self.sample_size = 1
-        self.beam_size = 1
 
 
     def train_mode(self, sample_size=1):
@@ -58,8 +58,8 @@ class Actor(nn.Module):
         self.mode = 'sample'
 
 
-    def beam_search(self, beam_size=10):
-        self.beam_size=beam_size
+    def beam_search(self, sample_size=10):
+        self.sample_size=sample_size
         self.eval()
         self.mode = 'beam_search'
 
@@ -70,51 +70,6 @@ class Actor(nn.Module):
         self.graph.batch_size  = self.fleet.time.shape[0]
 
 
-    def widen_data(self):
-
-        F = dir(self.fleet)
-        for s in F:
-            x = getattr(self.fleet, s)
-            if isinstance(x, torch.Tensor):
-                if len(x.shape) > 0:
-                    y = widen(x, factor=self.beam_size)
-                    setattr(self.fleet, s, y)
-
-        G = dir(self.graph)
-        for s in G:
-            x = getattr(self.graph, s)
-            if isinstance(x, torch.Tensor):
-                if len(x.shape) > 0:
-                    y = widen(x, factor=self.beam_size)
-                    setattr(self.graph, s, y)
-
-        self.node_embeddings = widen(self.node_embeddings, factor=self.beam_size)
-        self.node_projections = widen(self.node_projections, factor=self.batch_size)
-        self.log_probs = widen(self.log_probs, factor=self.beam_size)
-
-
-    def select_data(self, index):
-        m = index.max().item()
-
-        F = dir(self.fleet)
-        for s in F:
-            x = getattr(self.fleet, s)
-            if isinstance(x, torch.Tensor):
-                if (len(x.shape) > 0) and (x.shape[0] >= m):
-                    setattr(self.fleet, s, x[index])
-
-        G = dir(self.graph)
-        for s in G:
-            x = getattr(self.graph, s)
-            if isinstance(x, torch.Tensor):
-                if (len(x.shape) > 0) and (x.shape[0] >= m):
-                    setattr(self.graph, s, x[index])
-
-        self.node_embeddings = self.node_embeddings[index]
-        self.node_projections = self.node_projections[index]
-        self.log_probs = self.log_probs[index]
-
-
 
     def forward(self, batch, *args, **kwargs):
 
@@ -123,21 +78,18 @@ class Actor(nn.Module):
         self.original_batch_size = graph_data['distance_matrix'].shape[0]
         self.batch_size = self.original_batch_size
 
-        if self.mode == 'sample':
-            graph_data = widen_dict(graph_data, self.sample_size)
-            fleet_data = widen_dict(fleet_data, self.sample_size)
+        self.num_nodes = graph_data['distance_matrix'].shape[1]
+        self.num_cars = fleet_data['start_time'].shape[1]
 
 
         self.graph = Graph(graph_data, device=self.device)
-        self.fleet = Fleet(fleet_data, device=self.device)
+        self.fleet = Fleet(fleet_data, num_nodes=self.num_nodes, device=self.device)
         self.num_nodes = self.graph.distance_matrix.shape[1]
-        self.num_cars = self.fleet.volume_capacity.shape[1]
         self.update_batch_size()
 
-
+        self.normalization = Normalization(self, normalize_position=True)
         if self.apply_normalization:
-            self.normalize()
-
+            self.normalization.normalize(self)
 
         self.num_depots = self.fleet.num_depots.max().item()
         self.num_movers_corrected = int(min(max(self.num_movers, self.num_depots), self.num_cars))
@@ -148,6 +100,11 @@ class Actor(nn.Module):
             encoder_mask = self.compute_encoder_mask()
             self.node_embeddings = self.encoder(encoder_input, encoder_mask)
             self.node_projections = self.projections(self.node_embeddings)
+
+
+        if self.mode == 'sample':
+            widen_data(self, include_embeddings=True, include_projections=True)
+            self.update_batch_size()
 
 
         self.log_probs = torch.zeros(self.batch_size).to(self.device)
@@ -173,15 +130,14 @@ class Actor(nn.Module):
             next_node, car_to_move, log_prob = self.compute_action(decoder_output, action_mask, mover_indices)
 
             if self.mode == 'beam_search':
-                self.widen_data()
+                widen_data(self, include_embeddings=True, include_projections=True)
                 self.update_batch_size()
 
             self.log_probs += log_prob
 
             self.update_time(next_node, car_to_move)
-            self.update_storage(next_node, car_to_move)
+            self.update_distance(next_node, car_to_move)
             self.update_node_path(next_node, car_to_move)
-            self.update_compatibility()
             self.update_traversed_nodes()
 
             self.return_to_depot()
@@ -194,63 +150,55 @@ class Actor(nn.Module):
             self.counter += 1
 
 
-        if self.mode == 'beam_search':
-            # we now must select out the best beam
-            p = self.log_probs.reshape(self.original_batch_size, self.beam_size)
-            a = torch.argmax(p, dim=1)
+        if self.mode in {'beam_search', 'sample'}:
+            # we now must select out the best k elments
+
+            incomplete = self.check_complete().float()
+            cost = self.compute_cost()
+
+            max_cost = cost.max()
+            masked_cost = (1 - incomplete)*cost + incomplete*max_cost*10
+
+            p = masked_cost.reshape(self.original_batch_size, self.sample_size)
+            a = torch.argmin(p, dim=1)
 
             b = torch.arange(self.original_batch_size).to(self.device)
-            b = b * self.beam_size
+            b = b * self.sample_size
 
             index = a + b
-            self.select_data(index=index)
+            select_data(self, index=index, include_projections=True, include_embeddings=True)
 
-        self.batch_size = self.fleet.time.shape[0]
-        self.adjust_arrival_times()
 
+        self.update_batch_size()
+        if self.apply_normalization:
+            self.normalization.inverse_normalize(self)
+
+        total_distance = self.fleet.distance.sum(dim=1).squeeze(1).detach()
+        total_time = self.fleet.time.sum(dim=1).squeeze(1).detach()
+        total_late_time = self.fleet.late_time.sum(dim=1).squeeze(1).detach()
 
         output = {
-            'cost': self.compute_cost().detach(),
+            'distance': total_distance.detach(),
+            'total_time': total_time.detach(),
             'log_probs': self.log_probs,
-            'late_time': self.fleet.late_time.detach(),
+            'late_time': total_late_time.detach(),
             'incomplete': self.check_complete(),
             'path': self.fleet.path,
             'arrival_times': self.fleet.arrival_times
         }
 
-
-        if self.mode == 'sample':
-
-            cost = output.get('cost')
-            batch_size = cost.shape[0]//self.sample_size
-            cost_1 = cost.reshape(batch_size, self.sample_size)
-            arg_min = torch.argmin(cost_1, dim=1)
-
-            def recover_results(x, ind, sample_size):
-                batch_size = x.shape[0]//sample_size
-                x_1 = x.reshape(batch_size, sample_size, *x.shape[1:])
-                s = [1 for i in range(len(x.shape)-1)]
-                ind = ind.reshape(batch_size, 1, *s).repeat(1, 1, *x.shape[1:])
-                y = torch.gather(x_1, dim=1, index=ind)
-                return y
-
-            for key in output:
-                x = output[key]
-                y = recover_results(x, arg_min, self.sample_size)
-                output[key] = y
-
         return output
 
 
     def consolidate_beams(self):
-        p = self.log_probs.reshape(self.original_batch_size, self.beam_size * self.beam_size)
-        a = torch.topk(p, dim=1, k=self.beam_size, largest=True)[1]
+        p = self.log_probs.reshape(self.original_batch_size, self.sample_size * self.sample_size)
+        a = torch.topk(p, dim=1, k=self.sample_size, largest=True)[1]
 
-        b = torch.arange(self.original_batch_size).unsqueeze(1).repeat(1, self.beam_size).to(self.device)
-        b = b * self.beam_size * self.beam_size
+        b = torch.arange(self.original_batch_size).unsqueeze(1).repeat(1, self.sample_size).to(self.device)
+        b = b * self.sample_size * self.sample_size
 
         ind = (a + b).reshape(-1)
-        self.select_data(ind)
+        select_data(self, index=ind, include_projections=True, include_embeddings=True)
 
 
     def adjust_arrival_times(self):
@@ -270,14 +218,11 @@ class Actor(nn.Module):
         #check for drive times being too long
         time_window_non_compatibility = 1 - self.graph.time_window_compatibility
 
-        #compatibility mask
-        non_compatibility_mask = 1 - self.graph.node_node_compatibility
-
         #compute diag mask
         diag = torch.diag(torch.ones(self.num_nodes)).unsqueeze(0).repeat(self.batch_size, 1, 1).to(self.device)
 
         # compute neighbors mask
-        m = (time_window_non_compatibility + non_compatibility_mask + diag > 0).float()
+        m = (time_window_non_compatibility + diag > 0).float()
 
         dist = self.graph.distance_matrix*(1 - m) + m*self.graph.max_dist*10
 
@@ -289,7 +234,7 @@ class Actor(nn.Module):
         neighbors_mask = (a == b).float().sum(dim=3)
 
 
-        m = (time_window_non_compatibility + non_compatibility_mask == 0).float()
+        m = (time_window_non_compatibility == 0).float()
         neighbs_time_mask = neighbors_mask*m
 
         #compute depot mask
@@ -316,27 +261,12 @@ class Actor(nn.Module):
                                     self.batch_size, 1, 1).repeat(1, self.num_cars, self.num_nodes)
         excess = ((max_distance - distances)*available_nodes).sum(dim=2)
 
-        #available volume
-        volume = self.fleet.volume.reshape(self.batch_size, self.num_cars)
 
         max_excess = excess.max()
-        max_volume = volume.max()
 
-        score = (num_available_nodes + max_excess + max_volume)*100 + (excess + max_volume)*10 + volume
+        score = (num_available_nodes + max_excess)*10 + excess
         return score
 
-
-    def compute_excess(self):
-        available_nodes = (self.check_non_depot_options().float() == 0).float()
-
-        ind = self.fleet.node.reshape(self.batch_size, self.num_cars, 1).repeat(1, 1, self.num_nodes)
-        distances = torch.gather(self.graph.distance_matrix, dim=1, index=ind)
-
-        max_distance = self.graph.distance_matrix.reshape(self.batch_size, -1).max(dim=1)[0].reshape(
-                                    self.batch_size, 1, 1).repeat(1, self.num_cars, self.num_nodes)
-
-        score = ((max_distance - distances)*available_nodes).sum(dim=2)
-        return score
 
 
     def check_complete(self):
@@ -354,11 +284,18 @@ class Actor(nn.Module):
             return True
 
 
-    def compute_loss(self):
-        self.loss = self.total_distance.detach()*self.log_probs
-
-
     def compute_cost(self):
+
+        dist = self.fleet.distance.sum(dim=1).squeeze(1)
+        time = self.fleet.time.sum(dim=1).squeeze(1)
+        lateness = self.fleet.late_time.sum(dim=1).squeeze(1)
+
+        #normally we compute the cost as a linear combination of these three quantities
+        return time
+
+
+
+    def compute_total_distance(self):
         p_2 = self.fleet.path
         p_1 = torch.cat([p_2[:,:,-1:], p_2[:,:,:-1]], dim=2)
 
@@ -380,9 +317,15 @@ class Actor(nn.Module):
 
 
     def update_traversed_nodes(self):
-        x = ((self.graph.volume_demand == 0) & (self.graph.weight_demand == 0)).float()
-        self.fleet.traversed_nodes = x.reshape(self.batch_size, self.num_nodes)
 
+        path_length = self.fleet.path.shape[2]
+        a = self.fleet.path.reshape(self.batch_size, self.num_cars, path_length, 1).repeat(1, 1, 1, self.num_nodes)
+        b = torch.arange(self.num_nodes).reshape(
+            1, 1, 1, self.num_nodes).repeat(
+            self.batch_size, self.num_cars, path_length, 1).to(self.device)
+
+        s = (a == b).float().reshape(self.batch_size, self.num_cars*path_length, self.num_nodes).sum(dim=1)
+        self.fleet.traversed_nodes = (s > 0).float()
 
 
     def compute_action(self, decoder_output, action_mask, mover_indices):
@@ -446,7 +389,7 @@ class Actor(nn.Module):
                 prob = torch.gather(probs, dim=1, index=ind)
 
             elif self.mode == 'beam_search':
-                prob, ind = torch.topk(probs, dim=1, k=self.beam_size, largest=True)
+                prob, ind = torch.topk(probs, dim=1, k=self.sample_size, largest=True)
 
             mover_index = ind // self.num_nodes
             next_node = ind % self.num_nodes
@@ -458,6 +401,33 @@ class Actor(nn.Module):
 
             return next_node, car_to_move, prob.log()
 
+
+    def update_distance(self, next_node, car_to_move):
+        ind = car_to_move.reshape(self.batch_size, 1)
+        n = self.fleet.node.reshape(self.batch_size, self.num_cars)
+        current_node = torch.gather(n, dim=1, index=ind).squeeze(1)
+
+        #compute distance to next node
+        ind_1 = current_node.reshape(-1, 1, 1).repeat(1, 1, self.num_nodes)
+        distances = torch.gather(self.graph.distance_matrix, dim=1, index=ind_1).squeeze(1)
+        ind_2 = next_node.reshape(-1, 1)
+        dist_to_next_node = torch.gather(distances, dim=1, index=ind_2).squeeze(1)
+
+        #compute current distance
+        t = self.fleet.distance.reshape(self.batch_size, self.num_cars)
+        current_distance = torch.gather(t, dim=1, index=car_to_move.reshape(self.batch_size, 1)).squeeze(1)
+
+        #compute updated_distance
+        updated_distance = current_distance + dist_to_next_node
+
+        #compute mover mask
+        a = torch.arange(self.num_cars).reshape(1, -1).repeat(self.batch_size, 1).to(self.device)
+        b = car_to_move.reshape(self.batch_size, 1).repeat(1, self.num_cars)
+        update_mask = (a == b).float().unsqueeze(2)
+
+        #update distance
+        t = updated_distance.reshape(self.batch_size, 1, 1).repeat(1, self.num_cars, 1)
+        self.fleet.distance = self.fleet.distance * (1 - update_mask) + t * update_mask
 
 
     def update_time(self, next_node, car_to_move):
@@ -490,9 +460,8 @@ class Actor(nn.Module):
         ind = next_node.reshape(-1, 1)
         end_times = self.graph.end_time.reshape(self.batch_size, self.num_nodes)
         end_time_next_node = torch.gather(end_times, dim=1, index=ind).squeeze(1)
+        late_time = F.relu(updated_time - end_time_next_node)
 
-        #update_late_time
-        self.fleet.late_time = self.fleet.late_time + F.relu(updated_time - end_time_next_node)
 
         #compute mover mask
         a = torch.arange(self.num_cars).reshape(1, -1).repeat(self.batch_size, 1).to(self.device)
@@ -503,59 +472,10 @@ class Actor(nn.Module):
         t = updated_time.reshape(self.batch_size, 1, 1).repeat(1, self.num_cars, 1)
         self.fleet.time = self.fleet.time*(1 - update_mask) + t*update_mask
 
+        # update_late_time
+        l = late_time.reshape(self.batch_size, 1, 1).repeat(1, self.num_cars, 1)
+        self.fleet.late_time = self.fleet.late_time*(1 - update_mask) + l*update_mask
 
-
-    def reset_storage(self):
-        node = self.fleet.node.long().reshape(self.batch_size, self.num_cars)
-        depot = self.fleet.depot.long().reshape(self.batch_size, self.num_cars)
-        at_depot = (node == depot).float().reshape(self.batch_size, self.num_cars, 1)
-
-        self.fleet.volume = self.fleet.volume*(1 - at_depot) + self.fleet.volume_capacity*at_depot
-        self.fleet.weight = self.fleet.weight*(1 - at_depot) + self.fleet.weight_capacity*at_depot
-
-
-    #this method simultaneously updates the storage of the fleet and of the graph
-    def update_storage(self, next_node, car_to_move):
-        #get demands at next node
-        ind = next_node.reshape(self.batch_size, 1)
-        v = self.graph.volume_demand.reshape(self.batch_size, self.num_nodes)
-        w = self.graph.weight_demand.reshape(self.batch_size, self.num_nodes)
-        next_node_volume = torch.gather(v, dim=1, index=ind).squeeze(1)
-        next_node_weight = torch.gather(w, dim=1, index=ind).squeeze(1)
-
-        #compute mover mask
-        a = torch.arange(self.num_cars).reshape(1, -1).repeat(self.batch_size, 1).to(self.device)
-        b = car_to_move.reshape(self.batch_size, 1).repeat(1, self.num_cars)
-        fleet_mask = (a == b).float()
-
-        #compute graph mask
-        a = torch.arange(self.num_nodes).reshape(1, -1).repeat(self.batch_size, 1)
-        b = next_node.reshape(self.batch_size, 1).repeat(1, self.num_nodes)
-        graph_mask = (a == b).float().unsqueeze(2)
-
-
-        #next node's volume and weight
-        volume = next_node_volume.reshape(self.batch_size, 1).repeat(1, self.num_cars)
-        weight = next_node_weight.reshape(self.batch_size, 1).repeat(1, self.num_cars)
-
-        #current car's volume and weight
-        v = self.fleet.volume.reshape(self.batch_size, self.num_cars)
-        w = self.fleet.weight.reshape(self.batch_size, self.num_cars)
-        ind = car_to_move.reshape(self.batch_size, 1)
-        car_volume = torch.gather(v, dim=1, index=ind).unsqueeze(1).repeat(1, self.num_nodes, 1)
-        car_weight = torch.gather(w, dim=1, index=ind).unsqueeze(1).repeat(1, self.num_nodes, 1)
-
-        #compute update values
-        new_graph_volume = F.relu(self.graph.volume_demand - car_volume) * graph_mask + self.graph.volume_demand * (1 - graph_mask)
-        new_graph_weight = F.relu(self.graph.weight_demand - car_weight) * graph_mask + self.graph.weight_demand * (1 - graph_mask)
-        new_fleet_volume = F.relu(self.fleet.volume - (fleet_mask * volume).unsqueeze(2))
-        new_fleet_weight = F.relu(self.fleet.weight - (fleet_mask * weight).unsqueeze(2))
-
-        #update
-        self.graph.volume_demand = new_graph_volume
-        self.graph.weight_demand = new_graph_weight
-        self.fleet.volume = new_fleet_volume
-        self.fleet.weight = new_fleet_weight
 
 
     def update_node_path(self, next_node, car_to_move):
@@ -575,28 +495,12 @@ class Actor(nn.Module):
         self.fleet.arrival_times = torch.cat(H, dim=2)
 
 
-    def update_compatibility(self):
-        ind = self.fleet.node.reshape(self.batch_size, self.num_cars, 1).repeat(1, 1, self.num_nodes).long()
-        mat = self.graph.node_node_compatibility
-        x = torch.gather(mat, dim=1, index=ind)
-        updated_incompatibility = ((self.fleet.incompatible_nodes + (1 - x)) > 0).float()
-        self.fleet.incompatible_nodes = updated_incompatibility
-
 
     def check_non_depot_options(self, use_time=True):
         '''
         Output is a byte tensor of shape [batch, num_cars, num_nodes] with entry (i,j) = 1 if
         the move of car i to node j is invalid
         '''
-
-        #check for incompatibility
-        incompatible = (self.fleet.incompatible_nodes == 1)
-
-        #check for volume
-        low_volume = 1 - self.check_volume()
-
-        #check for weight
-        low_weight = 1 - self.check_weight()
 
         if use_time:
             #check for arrival times
@@ -613,9 +517,9 @@ class Actor(nn.Module):
 
         # has value of 1 if the move to that node is NOT possible
         if use_time:
-            unavailable_moves = (low_volume | low_weight | too_far | is_depot | incompatible | traversed_nodes)
+            unavailable_moves = (too_far | is_depot | traversed_nodes)
         else:
-            unavailable_moves = (low_volume | low_weight | is_depot | incompatible | traversed_nodes)
+            unavailable_moves = (is_depot | traversed_nodes)
 
         return unavailable_moves
 
@@ -718,7 +622,6 @@ class Actor(nn.Module):
         return output
 
 
-
     def get_mover_indices(self, unavailable_moves):
         depot = self.fleet.depot.reshape(self.batch_size, self.num_cars).long()
         current_node = self.fleet.node.reshape(self.batch_size, self.num_cars).long()
@@ -764,24 +667,6 @@ class Actor(nn.Module):
         return attainable
 
 
-
-    def check_volume(self):
-        # check for volume
-        v = self.fleet.volume.reshape(self.batch_size, self.num_cars, 1).repeat(1, 1, self.num_nodes)
-        a = self.graph.volume_demand.reshape(self.batch_size, 1, self.num_nodes).repeat(1, self.num_cars, 1)
-        enough_volume = (v >= a)
-        return enough_volume
-
-
-    def check_weight(self):
-        # check for weight
-        w = self.fleet.weight.reshape(self.batch_size, self.num_cars, 1).repeat(1, 1, self.num_nodes)
-        b = self.graph.weight_demand.reshape(self.batch_size, 1, self.num_nodes).repeat(1, self.num_cars, 1)
-        enough_weight = (w >= b)
-        return enough_weight
-
-
-
     def return_to_depot(self):
         unavailable_moves = 1 - self.check_non_depot_options(use_time=False).float()
         return_to_depot = (unavailable_moves.reshape(self.batch_size, -1).sum(dim=1) == 0).float()
@@ -797,7 +682,6 @@ class Actor(nn.Module):
             return_to_depot = return_to_depot.long()
             next_node = return_to_depot*depot + (1 - return_to_depot)*node
 
-
             #update time
             return_to_depot = return_to_depot.unsqueeze(2).float()
 
@@ -806,7 +690,7 @@ class Actor(nn.Module):
             drive_times = torch.gather(self.graph.time_matrix, dim=1, index=ind_1)
             ind_2 = next_node.reshape(self.batch_size, self.num_cars, 1)
             time_to_next_node = torch.gather(drive_times, dim=2, index=ind_2)
-            self.fleet.time = self.fleet.time*(1 - return_to_depot) + time_to_next_node*return_to_depot
+            self.fleet.time = self.fleet.time + time_to_next_node*return_to_depot
 
             #update node
             self.fleet.node = next_node
@@ -815,66 +699,6 @@ class Actor(nn.Module):
             n = self.fleet.node.reshape(self.batch_size, self.num_cars, 1)
             self.fleet.path = torch.cat([self.fleet.path, n], dim=2)
 
-            #update storage
-            self.fleet.volume = self.fleet.volume * (1 - return_to_depot) + self.fleet.volume_capacity * return_to_depot
-            self.fleet.weight = self.fleet.weight * (1 - return_to_depot) + self.fleet.weight_capacity * return_to_depot
-
-            #update incompatibility
-            return_to_depot = return_to_depot.reshape(self.batch_size, self.num_cars, 1).repeat(1, 1, self.num_nodes)
-            self.fleet.incompatible_nodes = \
-                self.fleet.incompatible_nodes*(1 - return_to_depot) + \
-                (1 - self.fleet.car_node_compatibility)*return_to_depot
-
-
-    def normalize(self, normalize_position=False):
-
-        greatest_drive_time = self.graph.time_matrix.reshape(self.batch_size, -1).max(dim=1)[0]
-        greatest_distance = self.graph.distance_matrix.reshape(self.batch_size, -1).max(dim=1)[0]
-
-        greatest_volume = self.graph.volume_demand.reshape(self.batch_size, -1).max(dim=1)[0]
-        greatest_weight = self.graph.weight_demand.reshape(self.batch_size, -1).max(dim=1)[0]
-
-        a = self.fleet.start_time.reshape(self.batch_size, -1)
-        b = self.graph.start_time.reshape(self.batch_size, -1)
-        earliest_start_time = torch.cat([a, b], dim=1).min(dim=1)[0]
-
-
-        mean_positions = self.graph.node_positions.mean(dim=1)
-        std_positions = torch.std(self.graph.node_positions, dim=1)
-
-        d = greatest_distance.reshape(self.batch_size, 1, 1).repeat(1, self.num_nodes, self.num_nodes)
-        self.graph.distance_matrix = self.graph.distance_matrix/d
-
-        t = greatest_drive_time.reshape(self.batch_size, 1, 1).repeat(1, self.num_nodes, self.num_nodes)
-        self.graph.time_matrix = self.graph.time_matrix/t
-
-        s = earliest_start_time.reshape(self.batch_size, 1, 1).repeat(1, self.num_nodes, 1)
-        t = greatest_drive_time.reshape(self.batch_size, 1, 1).repeat(1, self.num_nodes, 1)
-        self.graph.start_time = (self.graph.start_time - s)/t
-        self.graph.end_time = (self.graph.end_time - s)/t
-        self.graph.unload_times = self.graph.unload_times/t
-
-
-        v = greatest_volume.reshape(self.batch_size, 1, 1).repeat(1, self.num_nodes, 1)
-        self.graph.volume_demand = self.graph.volume_demand/v
-
-        w = greatest_weight.reshape(self.batch_size, 1, 1).repeat(1, self.num_nodes, 1)
-        self.graph.weight_demand = self.graph.weight_demand/w
-
-        v = greatest_volume.reshape(self.batch_size, 1, 1).repeat(1, self.num_cars, 1)
-        self.fleet.volume_capacity = self.fleet.volume_capacity/v
-
-        w = greatest_weight.reshape(self.batch_size, 1, 1).repeat(1, self.num_cars, 1)
-        self.fleet.weight_capacity = self.fleet.weight_capacity/w
-
-
-        if normalize_position:
-            m = mean_positions.reshape(self.batch_size, 1, mean_positions.shape[-1]).repeat(1, self.num_nodes, 1)
-            st = std_positions.reshape(self.batch_size, 1, std_positions.shape[-1]).repeat(1, self.num_nodes, 1)
-            self.graph.node_positions = (self.graph.node_positions - m)/st
-
-        self.normalization_params = {
-            'greatest_distance': greatest_distance, 'greatest_drive_time': greatest_drive_time,
-            'earliest_start_time': earliest_start_time, 'greatest_volume': greatest_volume,
-            'greatest_weight': greatest_weight, 'mean_positions': mean_positions, 'std_positions': std_positions
-        }
+            #update arrival time
+            t = self.fleet.time.reshape(self.batch_size, self.num_cars, 1)
+            self.fleet.arrival_times = torch.cat([self.fleet.arrival_times, t], dim=2)

@@ -1,5 +1,4 @@
 import torch
-from fleet_beam_search_2.utils.actor_utils import widen
 
 
 class Graph(object):
@@ -10,14 +9,10 @@ class Graph(object):
 
         self.start_time = graph_data['start_times']
         self.end_time = graph_data['end_times']
-        self.volume_demand = graph_data['volume_demand']
-        self.weight_demand = graph_data['weight_demand']
-        self.unload_times = graph_data['unload_times']
         self.depot = graph_data['depot']
         self.node_positions = graph_data['node_vector']
         self.distance_matrix = graph_data['distance_matrix']
         self.time_matrix = graph_data['time_matrix']
-        self.node_node_compatibility = graph_data['node_node_compatibility_matrix']
 
         self.num_nodes = self.distance_matrix.shape[1]
         self.batch_size = self.distance_matrix.shape[0]
@@ -28,20 +23,14 @@ class Graph(object):
         self.max_dist = self.distance_matrix.max()
         self.max_drive_time = self.time_matrix.max()
 
-        self.incorporate_unload_times()
-
 
     def correct_depot_features(self):
-        self.weight_demand = self.weight_demand * (1 - self.depot)
-        self.volume_demand = self.volume_demand * (1 - self.depot)
         self.start_time = self.start_time * (1 - self.depot)
         self.end_time = self.end_time * (1 - self.depot)
-        self.unload_times = self.unload_times * (1 - self.depot)
 
 
     def construct_vector(self):
-        L = [self.node_positions, self.start_time, self.end_time,
-             self.volume_demand, self.weight_demand, self.depot]
+        L = [self.node_positions, self.start_time, self.end_time, self.depot]
         self.vector = torch.cat(L, dim=2)
         return self.vector
 
@@ -77,9 +66,3 @@ class Graph(object):
         y = self.end_time.reshape(self.batch_size, 1, self.num_nodes).repeat(1, self.num_nodes, 1)
         time_mask = (x + self.time_matrix <= y).float()
         return time_mask
-
-
-    def incorporate_unload_times(self):
-        self.end_time = self.end_time - self.unload_times
-
-

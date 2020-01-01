@@ -1,27 +1,28 @@
 {
   "train_dataset_size": 10,
-  "test_dataset_size": 10,
+  "validation_dataset_size": 10,
+  "baseline_dataset_size": 10,
+  "overfit_test": 1,
 
   "num_nodes": 12,
   "num_depots": 1,
-  "num_cars": 12,
 
-
-  "sample_size":5,
-  "beam_size": 5,
+  "sample_size": 5,
+  "use_beam_search": true,
   "embedding_size": 128,
+  "gradient_clipping": true,
+
   "num_neighbors_encoder": 20,
   "num_neighbors_action": 12,
   "num_movers": 12,
 
   "baseline_update_period": 5,
-
   "device": "cpu",
-  "run_tests": "false",
-  "save_results": "false",
 
+  "run_tests": true,
+  "save_results": false,
   "learning_rate": 0.0001,
-  "batch_size": 100,
+  "batch_size": 250,
   "test_batch_size": 20,
   "num_epochs": 5000
 }

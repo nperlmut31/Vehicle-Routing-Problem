@@ -1,25 +1,8 @@
 
-def widen_batch(data, widen_factor=10):
-
-    if isinstance(data, dict):
-        D = {}
-        for key in data:
-            x = data[key]
-            s = [widen_factor] + [1 for i in range(len(x.shape))]
-            y = x.unsqueeze(0).repeat(*s)
-            z = y.reshape(widen_factor*x.shape[0], *x.shape[1:])
-            D[key] = z
-        return D
-    else:
-        x = data
-        s = [widen_factor] + [1 for i in range(len(x.shape))]
-        y = x.unsqueeze(0).repeat(*s)
-        z = y.reshape(widen_factor * x.shape[0], *x.shape[1:])
-        return z
+import torch
 
 
-
-def widen(datum, factor):
+def widen_tensor(datum, factor):
 
     if len(datum.shape) == 0:
         return datum
@@ -39,9 +22,71 @@ def widen(datum, factor):
     return datum
 
 
-def widen_dict(data_dict, factor):
-    D = {}
-    for key in data_dict:
-        D[key] = widen(data_dict[key], factor)
-    return D
+def widen_data(actor, include_embeddings=True, include_projections=True):
+
+    F = dir(actor.fleet)
+    for s in F:
+        x = getattr(actor.fleet, s)
+        if isinstance(x, torch.Tensor):
+            if len(x.shape) > 0:
+                y = widen_tensor(x, factor=actor.sample_size)
+                setattr(actor.fleet, s, y)
+
+    G = dir(actor.graph)
+    for s in G:
+        x = getattr(actor.graph, s)
+        if isinstance(x, torch.Tensor):
+            if len(x.shape) > 0:
+                y = widen_tensor(x, factor=actor.sample_size)
+                setattr(actor.graph, s, y)
+
+    actor.log_probs = widen_tensor(actor.log_probs, factor=actor.sample_size)
+
+    if include_embeddings:
+        actor.node_embeddings = widen_tensor(actor.node_embeddings, factor=actor.sample_size)
+
+    if include_projections:
+        def widen_projection(x, size):
+            if len(x.shape) > 3:
+                y = x.unsqueeze(2).repeat(1, 1, size, 1, 1)
+                return y.reshape(x.shape[0], x.shape[1] * size, x.shape[2], x.shape[3])
+            else:
+                return widen_tensor(x, size)
+
+        actor.node_projections = {key : widen_projection(actor.node_projections[key], actor.sample_size)
+                                 for key in actor.node_projections}
+
+
+
+def select_data(actor, index, include_embeddings=True, include_projections=True):
+    m = index.max().item()
+
+    F = dir(actor.fleet)
+    for s in F:
+        x = getattr(actor.fleet, s)
+        if isinstance(x, torch.Tensor):
+            if (len(x.shape) > 0) and (x.shape[0] >= m):
+                setattr(actor.fleet, s, x[index])
+
+    G = dir(actor.graph)
+    for s in G:
+        x = getattr(actor.graph, s)
+        if isinstance(x, torch.Tensor):
+            if (len(x.shape) > 0) and (x.shape[0] >= m):
+                setattr(actor.graph, s, x[index])
+
+    actor.log_probs = actor.log_probs[index]
+
+    if include_embeddings:
+        actor.node_embeddings = actor.node_embeddings[index]
+
+    if include_projections:
+        def select_projection(x, index):
+            if len(x.shape) > 3:
+                return x[:,index,:,:]
+            else:
+                return x[index]
+
+        actor.node_projections = {key : select_projection(actor.node_projections[key], index)
+                                 for key in actor.node_projections}
 

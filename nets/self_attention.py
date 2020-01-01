@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from torch import nn
-from fleet_beam_search_2.nets.multi_headed_attention import MultiHeadAttention
+from just_time_windows.nets.multi_headed_attention import MultiHeadAttention
 import math
 
 
