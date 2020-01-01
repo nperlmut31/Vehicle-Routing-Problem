@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from just_time_windows.nets.decoder import Decoder
-from just_time_windows.nets.projections import Projections
-from just_time_windows.nets.self_attention import Encoder
+from nets.decoder import Decoder
+from nets.projections import Projections
+from nets.encoder import Encoder
 
 
 class Model(nn.Module):
@@ -26,6 +26,12 @@ class Model(nn.Module):
 
         self.projections = Projections(n_heads=num_heads,
                                        embed_dim=embedding_size)
+
+        self.fleet_attention = Encoder(n_heads=num_heads,
+                                       embed_dim=embedding_size,
+                                       n_layers=1,
+                                       feed_forward_hidden=ff_hidden,
+                                       node_dim=embedding_size+1)
 
 
 

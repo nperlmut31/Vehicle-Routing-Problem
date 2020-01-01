@@ -1,17 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from just_time_windows.Actor.graph import Graph
-from just_time_windows.Actor.fleet import Fleet
-from just_time_windows.utils.actor_utils import widen_data, select_data
-from just_time_windows.Actor.normalization import Normalization
+from Actor.graph import Graph
+from Actor.fleet import Fleet
+from utils.actor_utils import widen_data, select_data
+from Actor.normalization import Normalization
 
 
 #This is the updated version of the actor
 class Actor(nn.Module):
 
     def __init__(self, model=None, num_movers=5, num_neighbors_encoder=5,
-                 num_neighbors_action=5, normalize=False,
+                 num_neighbors_action=5, normalize=False, use_fleet_attention=True,
                  device='cpu'):
         super().__init__()
 
@@ -22,6 +22,7 @@ class Actor(nn.Module):
 
         self.apply_normalization = normalize
         self.normalization = None
+        self.use_fleet_attention = use_fleet_attention
 
 
         if model is None:
@@ -30,6 +31,7 @@ class Actor(nn.Module):
             self.encoder = model.encoder.to(self.device)
             self.decoder = model.decoder.to(self.device)
             self.projections = model.projections.to(self.device)
+            self.fleet_attention = model.fleet_attention.to(self.device)
             self.mode = 'train'
 
 
@@ -140,14 +142,16 @@ class Actor(nn.Module):
             self.update_node_path(next_node, car_to_move)
             self.update_traversed_nodes()
 
-            self.return_to_depot()
-            self.update_traversed_nodes()
+            #self.return_to_depot()
+            #self.update_traversed_nodes()
 
             if (self.mode == 'beam_search') and (self.counter > 0):
                 self.consolidate_beams()
 
             self.update_batch_size()
             self.counter += 1
+
+        self.return_to_depot_1()
 
 
         if self.mode in {'beam_search', 'sample'}:
@@ -271,8 +275,9 @@ class Actor(nn.Module):
 
     def check_complete(self):
         has_untraversed_nodes = ((self.fleet.traversed_nodes == 0).float().sum(dim=1) > 0)
-        has_cars_in_field = ((self.fleet.node != self.fleet.depot).sum(dim=1) > 0)
-        incomplete = (has_untraversed_nodes | has_cars_in_field)
+        #has_cars_in_field = ((self.fleet.node != self.fleet.depot).sum(dim=1) > 0)
+        #incomplete = (has_untraversed_nodes | has_cars_in_field)
+        incomplete = has_untraversed_nodes
         return incomplete
 
 
@@ -596,20 +601,24 @@ class Actor(nn.Module):
         mean_graph_vector = node_vectors.mean(dim=1)
 
 
+        #current feature values
+        feature_values = self.fleet.construct_vector()
+
+
         #other cars in field
         num_movers = mover_indices.shape[1]
         if num_movers == 1:
             movers_vector = current_node_vector*0
-        else:
+        elif not self.use_fleet_attention:
             a = mover_indices.reshape(self.batch_size, num_movers, 1).repeat(1, 1, self.num_cars)
             b = torch.arange(self.num_cars).reshape(1, 1, self.num_cars).repeat(self.batch_size, num_movers, 1).to(self.device)
             c = ((a == b).float().sum(dim=1) > 0).float()
             movers_mask = c.reshape(self.batch_size, self.num_cars, 1).repeat(1, 1, embedding_size)
             movers_vector = ((current_node_vector*movers_mask).sum(dim=1).unsqueeze(1) - current_node_vector)/(num_movers - 1)
+        else:
+            x = torch.cat([current_node_vector, feature_values], dim=2)
+            movers_vector = self.fleet_attention(x)
 
-
-        #current feature values
-        feature_values = self.fleet.construct_vector()
 
         L = [current_node_vector, depot_vector, mean_graph_vector, movers_vector, feature_values]
         pre_output = torch.cat(L, dim=2)
@@ -702,3 +711,41 @@ class Actor(nn.Module):
             #update arrival time
             t = self.fleet.time.reshape(self.batch_size, self.num_cars, 1)
             self.fleet.arrival_times = torch.cat([self.fleet.arrival_times, t], dim=2)
+
+
+    def return_to_depot_1(self):
+
+        depot = self.fleet.depot.reshape(self.batch_size, self.num_cars).long()
+        node = self.fleet.node.reshape(self.batch_size, self.num_cars).long()
+
+        #compute next node
+        next_node = depot
+
+        #update time
+        current_node = self.fleet.node
+        ind_1 = current_node.reshape(self.batch_size, self.num_cars, 1).repeat(1, 1, self.num_nodes)
+        drive_times = torch.gather(self.graph.time_matrix, dim=1, index=ind_1)
+        ind_2 = next_node.reshape(self.batch_size, self.num_cars, 1)
+        time_to_next_node = torch.gather(drive_times, dim=2, index=ind_2)
+        self.fleet.time = self.fleet.time + time_to_next_node
+
+
+        #update distance
+        current_node = self.fleet.node
+        ind_1 = current_node.reshape(self.batch_size, self.num_cars, 1).repeat(1, 1, self.num_nodes)
+        drive_distances = torch.gather(self.graph.distance_matrix, dim=1, index=ind_1)
+        ind_2 = next_node.reshape(self.batch_size, self.num_cars, 1)
+        distance_to_next_node = torch.gather(drive_distances, dim=2, index=ind_2)
+        self.fleet.distance = self.fleet.distance + distance_to_next_node
+
+
+        #update node
+        self.fleet.node = next_node
+
+        #update path
+        n = self.fleet.node.reshape(self.batch_size, self.num_cars, 1)
+        self.fleet.path = torch.cat([self.fleet.path, n], dim=2)
+
+        #update arrival time
+        t = self.fleet.time.reshape(self.batch_size, self.num_cars, 1)
+        self.fleet.arrival_times = torch.cat([self.fleet.arrival_times, t], dim=2)

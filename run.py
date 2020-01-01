@@ -11,10 +11,10 @@ dir_path = os.path.dirname(os.path.realpath(__file__))
 q = os.path.join(dir_path, '..')
 sys.path.append(q)
 
-from just_time_windows.nets.model import Model
-from just_time_windows.Actor.actor import Actor
-from just_time_windows.dataloader import VRP_Dataset
-from just_time_windows.google_solver.google_model import evaluate_google_model
+from nets.model import Model
+from Actor.actor import Actor
+from dataloader import VRP_Dataset
+from google_solver.google_model import evaluate_google_model
 
 
 import torch.optim as optim
@@ -81,6 +81,8 @@ gradient_clipping = params['gradient_clipping']
 num_neighbors_encoder = params['num_neighbors_encoder']
 num_neighbors_action = params['num_neighbors_action']
 num_movers = params['num_movers']
+use_fleet_attention = params['use_fleet_attention']
+
 learning_rate = params['learning_rate']
 batch_size = params['batch_size']
 test_batch_size = params['test_batch_size']

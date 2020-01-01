@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from torch import nn
-from just_time_windows.nets.multi_headed_attention import MultiHeadAttention
+from nets.multi_headed_attention import MultiHeadAttention
 import math
 
 
@@ -103,6 +103,7 @@ class MultiHeadAttentionLayer(nn.Sequential):
 
 
 class Encoder(nn.Module):
+
     def __init__(
             self,
             n_heads,
@@ -123,8 +124,14 @@ class Encoder(nn.Module):
         ))
 
 
-    def forward(self, input, mask, *args, **kwargs):
+    def forward(self, input, mask=None, *args, **kwargs):
 
+        device = input.device
+        batch_size = input.shape[0]
+        num_nodes = input.shape[1]
+
+        if mask is None:
+            mask = torch.ones(batch_size, num_nodes, num_nodes).to(device).float()
 
         mask = (mask == 0)
 
